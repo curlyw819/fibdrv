@@ -6,6 +6,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/uaccess.h>
 
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
@@ -17,26 +18,148 @@ MODULE_VERSION("0.1");
 /* MAX_LENGTH is set to 92 because
  * ssize_t can't fit the number > 92
  */
-#define MAX_LENGTH 92
+#define MAX_LENGTH 100
+#define MAX_DIGIT 100
+#define OFFSET 48
+
+typedef struct {
+    char decimal[MAX_DIGIT];
+    int length;
+} bignum;
+
+#define bn_tmp(x) \
+    bn_new(&(bignum) { .length = 0 }, x)
+
+bignum *bn_new(bignum *bn, char decimal[])
+{
+    bn->length = strlen(decimal);
+    memcpy(bn->decimal, decimal, bn->length);
+    return bn;
+}
+
+void bn_add(bignum *x, bignum *y, bignum *dest)
+{
+    if (x->length < y->length)
+        return bn_add(y, x, dest);
+    int carry = 0;
+    for (int i = 0; i < y->length; i++) {
+        dest->decimal[i] = y->decimal[i] + x->decimal[i] + carry - OFFSET;
+        if (dest->decimal[i] >= 10 + OFFSET) {
+            carry = 1;
+            dest->decimal[i] -= 10;
+        } else
+            carry = 0;
+    }
+    for (int i = y->length; i < x->length; i++) {
+        dest->decimal[i] = x->decimal[i] + carry;
+        if (dest->decimal[i] >= 10 + OFFSET) {
+            carry = 1;
+            dest->decimal[i] -= 10;
+        } else
+            carry = 0;
+    }
+    dest->length = x->length;
+    dest->decimal[dest->length] = carry + OFFSET;
+    if (carry)
+        dest->length++;
+    dest->decimal[dest->length] = '\0';
+}
+
+void bn_subtract(bignum *x, bignum *y, bignum *dest)
+{
+    bignum *x_copy = bn_tmp(x->decimal);
+    if (x->length == y->length) {
+        int length = x->length;
+
+        while (x->decimal[length - 1] == y->decimal[length - 1]) {
+            length--;
+            if (length == 1) {
+                dest->length = 1;
+                dest->decimal[0] = x->decimal[0] - y->decimal[0];
+            }
+        }
+        x_copy->decimal[length - 1] =
+            x->decimal[length - 1] - y->decimal[length - 1] + OFFSET;
+        x_copy->decimal[length] = '\0';
+        x_copy->length = length;
+    }
+
+    char nine[MAX_DIGIT];
+    for (int i = 0; i < x->length - 1; i++)
+        nine[i] = '9';
+    nine[x_copy->length - 1] = '\0';
+    bignum *nines = bn_tmp(nine);
+
+    if (!(--x_copy->decimal[x_copy->length - 1]))
+        x_copy->length--;
+
+    for (int i = 0; i < y->length; i++) {
+        nines->decimal[i] -= y->decimal[i];
+        nines->decimal[i] += OFFSET;
+    }
+    bn_add(x_copy, nines, x_copy);
+    bn_add(bn_tmp("1"), x_copy, dest);
+}
+
+void bn_multiply(bignum *x, bignum *y, bignum *dest)
+{
+    if (x->length < y->length)
+        return bn_multiply(y, x, dest);
+    bignum *sum = bn_tmp("0");
+    for (int i = 0; i < y->length; i++) {
+        bignum *tmp = bn_tmp("0");
+        for (int j = 0; j < y->decimal[i] - OFFSET; j++)
+            bn_add(x, tmp, tmp);
+        for (int j = tmp->length; j >= 0; j--)
+            tmp->decimal[j + i] = tmp->decimal[j];
+        for (int j = 0; j < i; j++)
+            tmp->decimal[j] = '0';
+        tmp->length += i;
+        bn_add(tmp, sum, sum);
+    }
+    dest->length = sum->length;
+    for (int i = 0; i <= sum->length; i++)
+        dest->decimal[i] = sum->decimal[i];
+}
 
 static dev_t fib_dev = 0;
 static struct cdev *fib_cdev;
 static struct class *fib_class;
 static DEFINE_MUTEX(fib_mutex);
 
-static long long fib_sequence(long long k)
+bignum *fib_sequence(int k)
 {
     /* FIXME: use clz/ctz and fast algorithms to speed up */
-    long long f[k + 2];
-
-    f[0] = 0;
-    f[1] = 1;
-
-    for (int i = 2; i <= k; i++) {
-        f[i] = f[i - 1] + f[i - 2];
+    bignum *a = bn_tmp("0"), *b = bn_tmp("1");
+    bignum *t1 = bn_tmp("0"), *t2 = bn_tmp("0");
+    bignum *tmp = bn_tmp("2");
+    if (k == 0)
+        return a;
+    int i = 31 - __builtin_clz(k);
+    for (; i >= 0; i--) {
+        bn_multiply(bn_tmp("2"), b, tmp);
+        bn_subtract(tmp, a, tmp);
+        bn_multiply(a, tmp, t1);
+        bn_multiply(b, b, tmp);
+        bn_multiply(a, a, t2);
+        bn_add(tmp, t2, t2);
+        for (int j = 0; j < t2->length; j++) {
+            a->decimal[j] = t1->decimal[j];
+            b->decimal[j] = t2->decimal[j];
+        }
+        a->length = t1->length;
+        b->length = t2->length;
+        if ((k >> i) & 1) {
+            bn_add(a, b, t1);
+            for (int j = 0; j < t1->length; j++) {
+                a->decimal[j] = b->decimal[j];
+                b->decimal[j] = t1->decimal[j];
+            }
+            a->length = b->length;
+            b->length = t1->length;
+        }
     }
-
-    return f[k];
+    return a;
 }
 
 static int fib_open(struct inode *inode, struct file *file)
@@ -60,7 +183,14 @@ static ssize_t fib_read(struct file *file,
                         size_t size,
                         loff_t *offset)
 {
-    return (ssize_t) fib_sequence(*offset);
+    char *rev_fib = fib_sequence(*offset)->decimal;
+    int length = strlen(rev_fib);
+    char result[MAX_DIGIT];
+    for (int i = 0; i < length; i++)
+        result[i] = rev_fib[length - 1 - i];
+    result[length] = '\0';
+    copy_to_user(buf, result, length + 1);
+    return 0;
 }
 
 /* write operation is skipped */
