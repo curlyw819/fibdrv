@@ -6,6 +6,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/time.h>
 #include <linux/uaccess.h>
 
 MODULE_LICENSE("Dual MIT/GPL");
@@ -18,8 +19,8 @@ MODULE_VERSION("0.1");
 /* MAX_LENGTH is set to 92 because
  * ssize_t can't fit the number > 92
  */
-#define MAX_LENGTH 100
-#define MAX_DIGIT 100
+#define MAX_LENGTH 500
+#define MAX_DIGIT 500
 #define OFFSET 48
 
 typedef struct {
@@ -27,8 +28,7 @@ typedef struct {
     int length;
 } bignum;
 
-#define bn_tmp(x) \
-    bn_new(&(bignum) { .length = 0 }, x)
+#define bn_tmp(x) bn_new(&(bignum){.length = 0}, x)
 
 bignum *bn_new(bignum *bn, char decimal[])
 {
@@ -65,102 +65,32 @@ void bn_add(bignum *x, bignum *y, bignum *dest)
     dest->decimal[dest->length] = '\0';
 }
 
-void bn_subtract(bignum *x, bignum *y, bignum *dest)
-{
-    bignum *x_copy = bn_tmp(x->decimal);
-    if (x->length == y->length) {
-        int length = x->length;
-
-        while (x->decimal[length - 1] == y->decimal[length - 1]) {
-            length--;
-            if (length == 1) {
-                dest->length = 1;
-                dest->decimal[0] = x->decimal[0] - y->decimal[0];
-            }
-        }
-        x_copy->decimal[length - 1] =
-            x->decimal[length - 1] - y->decimal[length - 1] + OFFSET;
-        x_copy->decimal[length] = '\0';
-        x_copy->length = length;
-    }
-
-    char nine[MAX_DIGIT];
-    for (int i = 0; i < x->length - 1; i++)
-        nine[i] = '9';
-    nine[x_copy->length - 1] = '\0';
-    bignum *nines = bn_tmp(nine);
-
-    if (!(--x_copy->decimal[x_copy->length - 1]))
-        x_copy->length--;
-
-    for (int i = 0; i < y->length; i++) {
-        nines->decimal[i] -= y->decimal[i];
-        nines->decimal[i] += OFFSET;
-    }
-    bn_add(x_copy, nines, x_copy);
-    bn_add(bn_tmp("1"), x_copy, dest);
-}
-
-void bn_multiply(bignum *x, bignum *y, bignum *dest)
-{
-    if (x->length < y->length)
-        return bn_multiply(y, x, dest);
-    bignum *sum = bn_tmp("0");
-    for (int i = 0; i < y->length; i++) {
-        bignum *tmp = bn_tmp("0");
-        for (int j = 0; j < y->decimal[i] - OFFSET; j++)
-            bn_add(x, tmp, tmp);
-        for (int j = tmp->length; j >= 0; j--)
-            tmp->decimal[j + i] = tmp->decimal[j];
-        for (int j = 0; j < i; j++)
-            tmp->decimal[j] = '0';
-        tmp->length += i;
-        bn_add(tmp, sum, sum);
-    }
-    dest->length = sum->length;
-    for (int i = 0; i <= sum->length; i++)
-        dest->decimal[i] = sum->decimal[i];
-}
 
 static dev_t fib_dev = 0;
 static struct cdev *fib_cdev;
 static struct class *fib_class;
 static DEFINE_MUTEX(fib_mutex);
 
-bignum *fib_sequence(int k)
+bignum *fib_sequence_org(int k)
 {
-    /* FIXME: use clz/ctz and fast algorithms to speed up */
-    bignum *a = bn_tmp("0"), *b = bn_tmp("1");
-    bignum *t1 = bn_tmp("0"), *t2 = bn_tmp("0");
-    bignum *tmp = bn_tmp("2");
+    int i;
+    bignum *f0 = bn_tmp("0");
+    bignum *f1 = bn_tmp("1");
+    bignum *ans = bn_tmp("0");
     if (k == 0)
-        return a;
-    int i = 31 - __builtin_clz(k);
-    for (; i >= 0; i--) {
-        bn_multiply(bn_tmp("2"), b, tmp);
-        bn_subtract(tmp, a, tmp);
-        bn_multiply(a, tmp, t1);
-        bn_multiply(b, b, tmp);
-        bn_multiply(a, a, t2);
-        bn_add(tmp, t2, t2);
-        for (int j = 0; j < t2->length; j++) {
-            a->decimal[j] = t1->decimal[j];
-            b->decimal[j] = t2->decimal[j];
-        }
-        a->length = t1->length;
-        b->length = t2->length;
-        if ((k >> i) & 1) {
-            bn_add(a, b, t1);
-            for (int j = 0; j < t1->length; j++) {
-                a->decimal[j] = b->decimal[j];
-                b->decimal[j] = t1->decimal[j];
-            }
-            a->length = b->length;
-            b->length = t1->length;
-        }
+        return f0;
+    if (k == 1)
+        return f1;
+
+    for (i = 2; i <= k; i++) {
+        bn_add(f0, f1, ans);
+        f0 = f1;
+        f1 = ans;
     }
-    return a;
+    return ans;
 }
+
+
 
 static int fib_open(struct inode *inode, struct file *file)
 {
@@ -183,14 +113,17 @@ static ssize_t fib_read(struct file *file,
                         size_t size,
                         loff_t *offset)
 {
-    char *rev_fib = fib_sequence(*offset)->decimal;
+    ktime_t k1, k2;
+    k1 = ktime_get();
+    char *rev_fib = fib_sequence_org(*offset)->decimal;
     int length = strlen(rev_fib);
     char result[MAX_DIGIT];
     for (int i = 0; i < length; i++)
         result[i] = rev_fib[length - 1 - i];
     result[length] = '\0';
     copy_to_user(buf, result, length + 1);
-    return 0;
+    k2 = ktime_sub(ktime_get(), k1);
+    return (long long) ktime_to_ns(k2);
 }
 
 /* write operation is skipped */
